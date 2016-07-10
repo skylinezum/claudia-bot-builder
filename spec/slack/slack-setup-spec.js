@@ -4,7 +4,7 @@
 const underTest = require('../../lib/slack/setup');
 
 describe('Slack setup', () => {
-  var api, bot, logError, parser, responder, botPromise, botResolve, botReject;
+  var api, bot, logError, parser, responder, botPromise, botResolve, botReject, asyncResolve, asyncReject, asyncResponder, asyncInvoker, asyncInvokerPromise;
 
   beforeEach(() => {
     api = jasmine.createSpyObj('api', ['get', 'post', 'addPostDeployStep']);
@@ -12,11 +12,17 @@ describe('Slack setup', () => {
       botResolve = resolve;
       botReject = reject;
     });
+    asyncInvokerPromise = new Promise((resolve, reject) => {
+      asyncResolve = resolve;
+      asyncReject = reject;
+    });
     bot = jasmine.createSpy().and.returnValue(botPromise);
     parser = jasmine.createSpy();
     logError = jasmine.createSpy();
     responder = jasmine.createSpy();
-    underTest(api, bot, logError, parser, responder);
+    asyncInvoker = jasmine.createSpy().and.returnValue(asyncInvokerPromise);
+    asyncResponder = jasmine.createSpy();
+    underTest(api, bot, logError, parser, responder, asyncInvoker, asyncResponder);
   });
 
   const singleMessageTemplate = {
@@ -173,7 +179,87 @@ describe('Slack setup', () => {
       result.then(res => expect(res).toEqual('some message'));
     });
   });
-
+  describe('delayed processing', () => {
+    var handler, env;
+    beforeEach( () => {
+      handler = api.post.calls.argsFor(0)[1];
+      env = {
+        slackToken: 'slack-token',
+        slackResponse: 'delayed'
+      };
+    });
+    describe('when the request does not contain the async flag', () => {
+      it('invokes the lambda again, adding the async flag to the event', () => {
+        handler({
+          post: singleMessageTemplate,
+          env: env
+        });
+        expect(asyncInvoker).toHaveBeenCalledWith({
+          post: singleMessageTemplate,
+          env: env,
+          async: true
+        });
+      });
+      it('does not resolve until the async invocation resolves', (done) => {
+        asyncInvoker.and.callFake(done);
+        handler({
+          post: singleMessageTemplate,
+          env: env
+        }).then(done.fail, done.fail);
+      });
+      it('completes the request when the async invocation resolves, without calling the bot function', (done) => {
+        handler({
+          post: singleMessageTemplate,
+          env: env
+        }).then( () => {
+          expect(bot).not.toHaveBeenCalled();
+        }).then(done, done.fail);
+        asyncResolve('ok');
+      });
+      it('rejects when the async invoke rejects', (done) => {
+        handler({
+          post: singleMessageTemplate,
+          env: env
+        }).then(done.fail, (message) => {
+          expect(message).toEqual('boom');
+          expect(bot).not.toHaveBeenCalled();
+        }).then(done);
+        asyncReject('boom');
+      });
+    });
+    describe('when the request contains the async flag', () => {
+      var parsedMessage;
+      beforeEach(() => {
+        parsedMessage = {
+          sender: 'User1',
+          text: 'MSG1'
+        };
+        parser.and.returnValue(parsedMessage);
+      });
+      it('invokes the bot function with the parsed event without completing the request', (done) => {
+        bot.and.callFake((botArg) => {
+          expect(botArg).toEqual(parsedMessage);
+          done();
+        });
+        handler({
+          post: singleMessageTemplate,
+          env: env,
+          async: true
+        }).then(done.fail, done.fail);
+      });
+      it('invokes the asyncResponder with the bot result, without invoking the responder', (done) => {
+        botResolve('Hello');
+        handler({
+          post: singleMessageTemplate,
+          env: env,
+          async: true
+        }).then(() => {
+          expect(asyncResponder).toHaveBeenCalledWith('Hello');
+          expect(responder).not.toHaveBeenCalledWith('Hello');
+        }).then(done, done.fail);
+      });
+    });
+  });
   describe('message actions webhook and message processor', () => {
     it('wires the POST request for Slack message actions to the message processor', () => {
       expect(api.post.calls.count()).toEqual(2);
